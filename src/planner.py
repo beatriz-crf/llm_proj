@@ -20,79 +20,152 @@ def post_process_response(response_data: dict) -> list:
                              
 def validate_plan(plan: list, part_dimensions: dict | None, material: str) -> list:
     """
-    Validates the process plan using advanced features:
-    - Uses helper functions for clear logical separation.
-    - Provides detailed, contextual warning messages.
-    - Auto-corrects parameters that exceed the machine's physical limits.
+    Validates and *auto-corrects* the process plan:
+    - Tool/operation sanity checks
+    - Feed clamped to machine max (if exceeded)
+    - Spindle RPM auto-filled/clamped from Vc ranges (material/op/tool Ø), then capped to machine limit
+    - Clear, contextual log notes in `validation_warnings`
     """
     validated_plan = []
-    
+
     # --- Get constraints from config ---
     machine_constraints = config.MACHINE_CONSTRAINTS
     tool_constraints = config.TOOL_CONSTRAINTS
     material_constraints = config.MATERIAL_CONSTRAINTS
-    
+
     # --- Infer material key ---
     material_key = _infer_material_key(material, material_constraints)
     material_properties = material_constraints.get(material_key, {})
 
     # === Step-Level Validation ===
     for step_data in plan:
-        # Create a copy to modify safely
-        step = dict(step_data)
+        step = dict(step_data)  # copy
         warnings = []
-        
-        operation = step.get("operation")
-        speed_rpm = step.get("spindle_speed_rpm")
-        feed_rate = step.get("feed_rate_mm_min")
-        tool_diam_mm = step.get("tool_diameter_mm")
-        
-        # --- 1. Machine limit validation and auto-correction ---
-        if speed_rpm and speed_rpm > machine_constraints["max_spindle_speed_rpm"]:
-            warnings.append(
-                f"RPM {speed_rpm} exceeds machine max ({machine_constraints['max_spindle_speed_rpm']}). "
-                f"Auto-corrected to max."
-            )
-            # Auto-correction
-            step["spindle_speed_rpm"] = machine_constraints["max_spindle_speed_rpm"]
-            speed_rpm = step["spindle_speed_rpm"] # Update local variable for subsequent checks
-            
-        if feed_rate and feed_rate > machine_constraints["max_feed_rate_mm_min"]:
-            warnings.append(
-                f"Feed rate {feed_rate} mm/min exceeds machine max ({machine_constraints['max_feed_rate_mm_min']}). "
-                f"Auto-corrected to max."
-            )
-            # Auto-correction
-            step["feed_rate_mm_min"] = machine_constraints["max_feed_rate_mm_min"]
-            feed_rate = step["feed_rate_mm_min"]
+        flags = []
 
-        # --- 2. Tool and operation compatibility validation ---
+        operation = step.get("operation")
         tool = step.get("tool_description")
+
+        # Normalize numeric types (avoid truthiness pitfalls with 0)
+        def _to_float(x):
+            try:
+                return float(x) if x is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        speed_rpm = _to_float(step.get("spindle_speed_rpm"))
+        feed_rate = _to_float(step.get("feed_rate_mm_min"))
+        tool_diam_mm = _to_float(step.get("tool_diameter_mm"))
+
+        # --- 1) Tool vs operation compatibility (yours) ---
         if operation in tool_constraints:
             valid_tools = tool_constraints[operation]
             if valid_tools and tool and not any(vt.lower() in tool.lower() for vt in valid_tools):
-                warnings.append(f"Tool '{tool}' may be inappropriate for '{operation}'. Recommended: {', '.join(valid_tools)}.")
+                warnings.append(
+                    f"Tool '{tool}' may be inappropriate for '{operation}'. "
+                    f"Recommended: {', '.join(valid_tools)}."
+                )
+                flags.append("tool_op_mismatch")
 
-        # --- 3. Mechanical sanity check for material and parameters (with detailed warnings) ---
+        # --- 2) Spindle RPM from Vc (auto-fill/clamp), then cap to machine ---
         op_category = _get_operation_category(operation)
-        if op_category and material_properties and tool_diam_mm and speed_rpm and tool_diam_mm > 0:
-            speed_range_m_min = material_properties.get(op_category)
-            
-            if speed_range_m_min:
-                min_rpm, max_rpm = _calculate_rpm_range(speed_range_m_min, tool_diam_mm)
-                
-                if not (min_rpm <= speed_rpm <= max_rpm):
-                    actual_vc = _calculate_vc_from_rpm(speed_rpm, tool_diam_mm)
-                    warnings.append(
-                        f"RPM {speed_rpm} (Vc≈{actual_vc:.0f} m/min) is outside the recommended range "
-                        f"({int(min_rpm)}-{int(max_rpm)}) for {material} using a {tool_diam_mm}mm tool for {op_category}."
-                    )
-        elif speed_rpm and not material_key:
-            warnings.append(f"Could not validate RPM for material '{material}'. Not found in knowledge base.")
 
+        if op_category and material_properties and tool_diam_mm and tool_diam_mm > 0:
+            rpm_min, rpm_mid, rpm_max = _recommend_rpm(op_category, material_properties, tool_diam_mm)
+
+            if rpm_min is not None:  # we have a constraint range
+                range_str = f"{int(rpm_min)}–{int(rpm_max)}"
+                machine_max = machine_constraints["max_spindle_speed_rpm"]
+                original = speed_rpm
+
+                # No-intersection: machine cannot reach the recommended minimum
+                if machine_max < rpm_min:
+                    step["spindle_speed_rpm"] = int(machine_max)
+                    warnings.append(
+                        f"Machine limit {machine_max} is below the recommended range {range_str}. "
+                        f"Set RPM to machine limit {machine_max} (underspeed)."
+                    )
+                    flags.append("rpm_machine_below_recommended")
+                else:
+                    if speed_rpm is None:
+                        # Fill with midpoint, then cap to machine
+                        rec = rpm_mid
+                        if rec > machine_max:
+                            warnings.append(
+                                f"RPM was null; recommended ≈{int(rpm_mid)} but capped to machine limit {machine_max}."
+                            )
+                            flags.append("rpm_filled_recommended_then_machine_cap")
+                            rec = machine_max
+                        else:
+                            warnings.append(f"RPM was null; set to recommended ≈{int(rpm_mid)}.")
+                            flags.append("rpm_filled_from_recommendation")
+                        step["spindle_speed_rpm"] = int(rec)
+
+                    else:
+                        corrected = speed_rpm
+                        # Clamp to recommended range first
+                        if speed_rpm < rpm_min:
+                            corrected = rpm_min
+                            warnings.append(
+                                f"RPM {int(speed_rpm)} below the recommended range {range_str}. "
+                                f"Clamped to recommended minimum {int(rpm_min)}."
+                            )
+                            flags.append("rpm_below_recommended_clamped")
+                        elif speed_rpm > rpm_max:
+                            corrected = rpm_max
+                            warnings.append(
+                                f"RPM {int(speed_rpm)} above the recommended range {range_str}. "
+                                f"Clamped to recommended maximum {int(rpm_max)}."
+                            )
+                            flags.append("rpm_above_recommended_clamped")
+
+                        # Cap to machine limit if still too high
+                        if corrected > machine_max:
+                            warnings.append(
+                                f"RPM {int(corrected)} exceeds the machine limit {machine_max}. Capped to {machine_max}."
+                            )
+                            flags.append("rpm_capped_to_machine")
+                            corrected = machine_max
+
+                        # Store if changed
+                        if original != corrected:
+                            step["spindle_speed_rpm"] = int(corrected)
+
+        elif speed_rpm is not None and not material_key:
+            warnings.append(
+                f"Material '{material}' unknown; skipped Vc-based RPM validation."
+            )
+            flags.append("material_unknown_skip_rpm")
+        elif speed_rpm is None and op_category:
+            warnings.append(
+                "RPM is null and Vc-based recommendation unavailable (missing material or tool diameter)."
+            )
+            flags.append("rpm_null_no_basis")
+
+
+        # --- 3) Feed: cap to machine max (keep your original behavior) ---
+        if feed_rate is not None and feed_rate > machine_constraints["max_feed_rate_mm_min"]:
+            warnings.append(
+                f"Feed rate {int(feed_rate)} mm/min exceeds machine max "
+                f"({machine_constraints['max_feed_rate_mm_min']}). Auto-corrected to max."
+            )
+            flags.append("feed_capped_to_machine")
+            step["feed_rate_mm_min"] = machine_constraints["max_feed_rate_mm_min"]
+
+        # --- 4) Optional: basic non-negative checks ---
+        if speed_rpm is not None and speed_rpm < 0:
+            warnings.append("Negative RPM replaced with 0.")
+            flags.append("rpm_negative_to_zero")
+            step["spindle_speed_rpm"] = 0
+        if feed_rate is not None and feed_rate < 0:
+            warnings.append("Negative feed rate replaced with 0.")
+            flags.append("feed_negative_to_zero")
+            step["feed_rate_mm_min"] = 0
+
+        step["validation_flags"] = flags
         step["validation_warnings"] = "; ".join(warnings) if warnings else "OK"
         validated_plan.append(step)
-        
+
     return validated_plan
 
 # ==============================================================================
@@ -110,6 +183,23 @@ def _get_operation_category(operation_name: str) -> str | None:
     if "reaming" in op_lower: return "reaming"
     if "tapping" in op_lower: return "tapping"
     return None
+
+def _recommend_rpm(op_category: str, material_props: dict, d_mm: float) -> tuple[float | None, float | None, float | None]:
+    """
+    Compute recommended RPM bounds (min, mid, max) from cutting-speed (Vc) ranges
+    and tool diameter. Returns (None, None, None) if not available.
+
+    RPM = (Vc[m/min] * 1000) / (π * D[mm])
+    """
+    vc_range = material_props.get(op_category)
+    if not vc_range or d_mm <= 0:
+        return None, None, None
+
+    vc_min, vc_max = vc_range
+    rpm_min = (vc_min * 1000.0) / (math.pi * d_mm)
+    rpm_max = (vc_max * 1000.0) / (math.pi * d_mm)
+    rpm_mid = 0.5 * (rpm_min + rpm_max)
+    return rpm_min, rpm_mid, rpm_max
 
 def _infer_material_key(material_text: str, material_db: dict) -> str | None:
     """Infers the standard knowledge base key from the user-provided material text."""

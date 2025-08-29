@@ -35,6 +35,16 @@ TOOL_CONSTRAINTS ={
         "Final Inspection": []
 }    
 
+# Per-tool acceptable physical diameter ranges (mm); used for deterministic validation.
+TOOL_DIAMETER_LIMITS = {
+    "Drill Bit":    (1.0, 25.0),
+    "Center Drill": (1.0, 6.0),
+    "Face Mill":    (20.0, 100.0),
+    "End Mill":     (2.0, 20.0),
+    "Chamfer Mill": (3.0, 12.0),
+    "Reamer":       (3.0, 20.0),
+}
+
 # Per-material, per-operation cutting speed ranges (m/min).
 # Ranges are conservative "ballpark" for CARBIDE in CNC milling.
 MATERIAL_CONSTRAINTS = {

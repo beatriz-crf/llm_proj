@@ -51,7 +51,7 @@ INCLUSION CRITERIA BY OPERATION
 - "Face Milling": a face needs to be created, trued, or surfaced.
 - "Roughing": large stock removal or heavy profiling.
 - "Finishing": final dimension/finish after roughing or light single-pass profiling.
-- "Center Drilling": only when drilling deeper/smaller holes where positioning matters.
+- "Center Drilling": when starting holes where drill walk is a risk (e.g., deeper holes, holes ≥ ~5 mm, or when precise positioning is critical).
 - "Drilling": only when holes exist.
 - "Reaming": only when tight hole tolerance / finish specified.
 - "Tapping": only when threaded holes are specified (include thread size in notes if known).
@@ -59,10 +59,10 @@ INCLUSION CRITERIA BY OPERATION
 - "Deburring": when burrs likely or request mentions deburr/edge break.
 - "Cleanup": only if required by process or customer request.
 
-TOOL RULES
+TOOL DIAMETER RULES
 Acceptable tool diameter ranges:
    • Drills: 1–25 mm
-   • Center Drills: 2–6 mm
+   • Center Drills: 1–6 mm
    • Face Mills: 20–100 mm
    • End Mills: 2–20 mm
    • Chamfer Mills: 3–12 mm

@@ -57,15 +57,41 @@ def validate_plan(plan: list, part_dimensions: dict | None, material: str) -> li
         feed_rate = _to_float(step.get("feed_rate_mm_min"))
         tool_diam_mm = _to_float(step.get("tool_diameter_mm"))
 
-        # --- 1) Tool vs operation compatibility (yours) ---
+        # --- 0) Tool diameter validation (simple: set to null if invalid) ---
+        tool_limits = getattr(config, "TOOL_DIAMETER_LIMITS", {})
+        tool = step.get("tool_description")
+
+        if tool and tool in tool_limits:
+            lo, hi = tool_limits[tool]
+            range_str = f"{int(lo)}–{int(hi)}"
+            if tool_diam_mm is not None:
+                if tool_diam_mm <= 0 or not (lo <= tool_diam_mm <= hi):
+                    warnings.append(
+                        f"Inappropriate tool diameter: {tool} {tool_diam_mm:.1f} mm outside the allowed range {range_str}mm. Human intervention required."
+                        f"Set tool_diameter_mm to null."
+                    )
+                    flags.append("tool_diameter_invalid_set_null")
+                    step["tool_diameter_mm"] = None
+                    step["notes"] = f"Check warnings"
+                    tool_diam_mm = None
+        # if tool not in tool_limits or diameter is None → skip diameter validation
+
+        # --- 1) Tool vs operation compatibility (set to null on mismatch) ---
         if operation in tool_constraints:
             valid_tools = tool_constraints[operation]
             if valid_tools and tool and not any(vt.lower() in tool.lower() for vt in valid_tools):
                 warnings.append(
-                    f"Tool '{tool}' may be inappropriate for '{operation}'. "
-                    f"Recommended: {', '.join(valid_tools)}."
+                    f"Inappropriate tool for '{operation}': '{tool}'. "
+                    f"Set tool_description to null. Recommended: {', '.join(valid_tools)}. Human intervention required."
                 )
-                flags.append("tool_op_mismatch")
+                flags.append("tool_op_mismatch_set_null")
+
+                # Null the tool to force review
+                step["tool_description"] = None
+                step["spindle_speed_rpm"] = None
+                step["feed_rate_mm_min"] = None
+                step["tool_diameter_mm"] = None
+                step["notes"] = f"Check warnings"
 
         # --- 2) Spindle RPM from Vc (auto-fill/clamp), then cap to machine ---
         op_category = _get_operation_category(operation)
